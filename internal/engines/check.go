@@ -275,6 +275,7 @@ func (engine *CheckEngine) checkDirectRelation(request *base.PermissionCheckRequ
 		// Query the relationships for the entity in the request.
 		// TupleFilter helps in filtering out the relationships for a specific entity and a permission.
 		var rit *database.TupleIterator
+		storage.RecordRelationshipDependency(ctx, request.GetTenantId(), filter)
 		rit, err = engine.dataReader.QueryRelationships(ctx, request.GetTenantId(), filter, request.GetMetadata().GetSnapToken(), database.NewCursorPagination())
 		// If there's an error in querying, return a denied permission response along with the error.
 		if err != nil {
@@ -355,6 +356,7 @@ func (engine *CheckEngine) checkTupleToUserSet(
 
 		// Use the filter to query for relationships in the database.
 		// relationshipReader.QueryRelationships() uses the filter to find and return matching relationships.
+		storage.RecordRelationshipDependency(ctx, request.GetTenantId(), filter)
 		rit, err := engine.dataReader.QueryRelationships(ctx, request.GetTenantId(), filter, request.GetMetadata().GetSnapToken(), database.NewCursorPagination())
 		if err != nil {
 			// If an error occurred while querying, return a "denied" response and the error.

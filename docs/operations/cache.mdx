@@ -71,6 +71,44 @@ No TTL is configured by default. Eviction is driven purely by **memory pressure*
   If you observe high cache miss rates after a schema version change, it is expected: the `schema_version` component of the key changes, making all prior entries stale. Size your `max_cost` to hold a comfortable working set for the most recent schema version in use.
 </Note>
 
+### Relationship-aware invalidation
+
+Permission checks record which relationship query scopes contributed to a cached
+decision. A relationship write or delete then evicts only the cache entries whose
+scopes intersect the changed tuples. A write to `document:1#viewer` does not flush
+checks for unrelated documents, relations, or tenants, and it also invalidates
+negative (denied) checks whose query range could now return a new relationship.
+
+Invalidation runs synchronously after the storage transaction commits. Checks
+that omit `snap_token` read the new head snapshot immediately, so a successful
+relationship change is visible to the next check without waiting for a fixed
+refresh interval.
+
+### Snapshot-isolated reads
+
+When `snap_token` is supplied, all relationship and attribute lookups in that
+check are evaluated against the same immutable snapshot. The in-memory engine
+keeps a committed snapshot view per write, just like the PostgreSQL MVCC path,
+so concurrent writes cannot expose a partially committed relationship update.
+Requests that do not supply a snapshot use the latest committed snapshot.
+
+### Cache hit-rate metrics
+
+The permission cache exports these OpenTelemetry metrics:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `cache_hits_total` | Counter | Permission check results served from the cache. |
+| `cache_misses_total` | Counter | Permission checks that had to evaluate the engine. |
+| `cache_hit_ratio` | Gauge | `hits / (hits + misses)` at the time of the latest check. |
+| `cache_hit` | Histogram | Existing per-check cache-hit signal, retained for compatibility. |
+
+Use the two counters in your metrics backend when you need a stable, aggregate
+hit ratio over an arbitrary window; the gauge is the latest instantaneous ratio.
+Invalidation activity can also be read through `CheckCacheStats` when embedding
+the cache engine in Go, which reports hits, misses, evictions, and hit rate
+without requiring an exporter scrape.
+
 ## Distributed Cache
 
 Permify does provide a distributed cache across availability zones (within an AWS region) via **Consistent Hashing**. Permify uses Consistent Hashing across its distributed instances for more efficient use of their individual caches.

@@ -394,6 +394,7 @@ func serve() func(cmd *cobra.Command, args []string) error {
 			slog.Error(err.Error())
 			return err
 		}
+		checkCacheInvalidator := cache.NewInvalidator(engineKeyCache)
 
 		watcher := storage.NewNoopWatcher()
 		if cfg.Service.Watch.Enabled {
@@ -403,6 +404,7 @@ func serve() func(cmd *cobra.Command, args []string) error {
 		// Initialize the storage with factory methods
 		dataReader := factories.DataReaderFactory(db)
 		dataWriter := factories.DataWriterFactory(db)
+		dataWriter = cache.NewInvalidatingDataWriter(dataWriter, checkCacheInvalidator)
 		bundleReader := factories.BundleReaderFactory(db)
 		bundleWriter := factories.BundleWriterFactory(db)
 		schemaReader := factories.SchemaReaderFactory(db)
@@ -452,6 +454,7 @@ func serve() func(cmd *cobra.Command, args []string) error {
 			checkEngine,
 			schemaReader,
 			engineKeyCache,
+			cache.WithInvalidator(checkCacheInvalidator),
 		)
 
 		// Create the checker either with load balancing or caching capabilities.
@@ -481,6 +484,7 @@ func serve() func(cmd *cobra.Command, args []string) error {
 			checkEngine,
 			schemaReader,
 			engineKeyCache,
+			cache.WithInvalidator(checkCacheInvalidator),
 		)
 
 		// Initialize the lookupEngine, which is responsible for looking up certain entities or values.

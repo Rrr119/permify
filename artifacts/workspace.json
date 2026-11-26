@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid38826",
+  "B": "/home/dev/feedback/uid38826",
+  "sha": "89b08c16fc207551a348766565921788059a2d9e",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "Permify",
+    "repo": "permify",
+    "sha": "89b08c16fc207551a348766565921788059a2d9e"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "permify",
+    "cloneUrl": "https://github.com/Rrr119/permify.git"
+  },
+  "at": "2026-11-26T04:04:12.562Z"
+}

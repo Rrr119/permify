@@ -3,7 +3,6 @@ package memory
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/hashicorp/go-memdb"
 
@@ -78,8 +77,8 @@ func (w *DataWriter) Write(_ context.Context, tenantID string, tupleCollection *
 		}
 	}
 
-	txn.Commit()
-	return snapshot.NewToken(time.Now()).Encode(), nil
+	snapshotValue := w.commitSnapshot(txn)
+	return snapshot.NewTokenFromValue(snapshotValue).Encode(), nil
 }
 
 // Delete - Delete relationship from repository
@@ -130,8 +129,8 @@ func (w *DataWriter) Delete(_ context.Context, tenantID string, tupleFilter *bas
 		}
 	}
 
-	txn.Commit()
-	return snapshot.NewToken(time.Now()).Encode(), nil
+	snapshotValue := w.commitSnapshot(txn)
+	return snapshot.NewTokenFromValue(snapshotValue).Encode(), nil
 }
 
 // RunBundle executes a bundle of operations in the context of a given tenant.
@@ -157,9 +156,21 @@ func (w *DataWriter) RunBundle(
 		}
 	}
 
-	txn.Commit()
+	snapshotValue := w.commitSnapshot(txn)
 
-	return snapshot.NewToken(time.Now()).Encode(), nil
+	return snapshot.NewTokenFromValue(snapshotValue).Encode(), nil
+}
+
+func (w *DataWriter) commitSnapshot(txn *memdb.Txn) uint64 {
+	w.database.LockSnapshotCommit()
+	defer w.database.UnlockSnapshotCommit()
+
+	// Allocate the token while the commit lock is held so token order matches
+	// the order in which immutable states are captured.
+	snapshotValue := w.database.NextSnapshot()
+	txn.Commit()
+	w.database.SaveSnapshot(snapshotValue, snapshot.Capture(w.database.DB))
+	return snapshotValue
 }
 
 // runOperation processes and executes database operations defined in TupleBundle and AttributeBundle within a given transaction.

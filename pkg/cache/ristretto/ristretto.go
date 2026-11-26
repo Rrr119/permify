@@ -53,6 +53,12 @@ func (r *Ristretto) Set(key string, value any, cost int64) bool {
 	return r.c.Set(key, value, cost)
 }
 
+// Delete - Removes a value from the cache
+func (r *Ristretto) Delete(key string) bool {
+	r.c.Del(key)
+	return true
+}
+
 // Wait - Waits for cache to be ready
 func (r *Ristretto) Wait() {
 	r.c.Wait()

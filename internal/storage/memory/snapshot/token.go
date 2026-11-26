@@ -3,6 +3,7 @@ package snapshot
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"fmt"
 	"time"
 
 	"github.com/Permify/permify/pkg/token"
@@ -21,8 +22,14 @@ type (
 
 // NewToken - Creates a new snapshot token
 func NewToken(value time.Time) token.SnapToken {
+	return NewTokenFromValue(uint64(value.UnixNano()))
+}
+
+// NewTokenFromValue creates a snapshot token from an already allocated
+// snapshot value.
+func NewTokenFromValue(value uint64) token.SnapToken {
 	return Token{
-		Value: uint64(value.UnixNano()),
+		Value: value,
 	}
 }
 
@@ -58,6 +65,9 @@ func (t EncodedToken) Decode() (token.SnapToken, error) {
 	b, err := base64.StdEncoding.DecodeString(t.Value)
 	if err != nil {
 		return nil, err
+	}
+	if len(b) != 8 {
+		return nil, fmt.Errorf("invalid snapshot token")
 	}
 	return Token{
 		Value: binary.LittleEndian.Uint64(b),

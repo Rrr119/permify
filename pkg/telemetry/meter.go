@@ -97,3 +97,18 @@ func NewHistogram(meter omt.Meter, name, unit, description string) omt.Int64Hist
 
 	return histogram
 }
+
+// NewFloat64Gauge creates a gauge for recording an instantaneous ratio or
+// other floating-point value.
+func NewFloat64Gauge(meter omt.Meter, name, description string) omt.Float64Gauge {
+	gauge, err := meter.Float64Gauge(
+		name,
+		omt.WithDescription(description),
+	)
+	if err != nil {
+		slog.Error("failed to create gauge", slog.String("error", err.Error()))
+		panic(err)
+	}
+
+	return gauge
+}

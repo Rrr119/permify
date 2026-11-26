@@ -3,14 +3,9 @@ package memory
 import (
 	"context"
 	"errors"
-	"slices" // Slice operations
+	"slices"
 	"sort"
 	"strconv"
-	"time"
-
-	"github.com/hashicorp/go-memdb"
-
-	"github.com/Permify/permify/internal/storage/memory/constants"
 
 	"github.com/Permify/permify/internal/storage"
 	"github.com/Permify/permify/internal/storage/memory/snapshot"
@@ -33,13 +28,15 @@ func NewDataReader(database *db.Memory) *DataReader {
 	}
 }
 
-// QueryRelationships queries the database for relationships based on the provided filter.
-func (r *DataReader) QueryRelationships(_ context.Context, tenantID string, filter *base.TupleFilter, _ string, pagination database.CursorPagination) (it *database.TupleIterator, err error) {
-	txn := r.database.DB.Txn(false)
-	defer txn.Abort()
+// QueryRelationships queries a consistent snapshot for relationships matching
+// the provided filter.
+func (r *DataReader) QueryRelationships(_ context.Context, tenantID string, filter *base.TupleFilter, snap string, pagination database.CursorPagination) (it *database.TupleIterator, err error) {
+	state, err := r.snapshotState(snap)
+	if err != nil {
+		return nil, err
+	}
 
 	var lowerBound string
-
 	if pagination.Cursor() != "" {
 		var t database.ContinuousToken
 		t, err = utils.EncodedContinuousToken{Value: pagination.Cursor()}.Decode()
@@ -49,45 +46,35 @@ func (r *DataReader) QueryRelationships(_ context.Context, tenantID string, filt
 		lowerBound = t.(utils.ContinuousToken).Value
 	}
 
-	// Get the index and arguments based on the filter.
-	index, args := utils.GetRelationTuplesIndexNameAndArgsByFilters(tenantID, filter)
+	tuples := filterRelationshipState(state, tenantID, filter)
 
-	// Get the result iterator based on the index and arguments.
-	var result memdb.ResultIterator
-	result, err = txn.LowerBound(constants.RelationTuplesTable, index, args...)
-	if err != nil {
-		return nil, errors.New(base.ErrorCode_ERROR_CODE_EXECUTION.String())
-	}
-
-	// Filter the result iterator and add the tuples to the collection.
-	tup := make([]storage.RelationTuple, 0, 10)
-	fit := memdb.NewFilterIterator(result, utils.FilterRelationTuplesQuery(tenantID, filter))
-	for obj := fit.Next(); obj != nil; obj = fit.Next() {
-		t, ok := obj.(storage.RelationTuple)
-		if !ok {
-			return nil, errors.New(base.ErrorCode_ERROR_CODE_TYPE_CONVERSATION.String())
-		}
-		tup = append(tup, t)
-	}
-
-	// Sort tuples based on the provided order field
-	sort.Slice(tup, func(i, j int) bool {
+	sort.Slice(tuples, func(i, j int) bool {
 		switch pagination.Sort() {
 		case "entity_id":
-			return tup[i].EntityID < tup[j].EntityID
+			return tuples[i].EntityID < tuples[j].EntityID
 		case "subject_id":
-			return tup[i].SubjectID < tup[j].SubjectID
+			return tuples[i].SubjectID < tuples[j].SubjectID
 		default:
-			return false // No sorting if order field is invalid
+			for _, comparison := range []int{
+				stringsCompare(tuples[i].EntityID, tuples[j].EntityID),
+				stringsCompare(tuples[i].Relation, tuples[j].Relation),
+				stringsCompare(tuples[i].SubjectType, tuples[j].SubjectType),
+				stringsCompare(tuples[i].SubjectID, tuples[j].SubjectID),
+				stringsCompare(tuples[i].SubjectRelation, tuples[j].SubjectRelation),
+			} {
+				if comparison != 0 {
+					return comparison < 0
+				}
+			}
+			return tuples[i].ID < tuples[j].ID
 		}
 	})
 
-	var tuples []*base.Tuple
+	var result []*base.Tuple
 	count := uint32(0)
 	limit := pagination.Limit()
 
-	for _, t := range tup {
-		// Skip tuples below the lower bound
+	for _, t := range tuples {
 		switch pagination.Sort() {
 		case "entity_id":
 			if t.EntityID < lowerBound {
@@ -99,23 +86,23 @@ func (r *DataReader) QueryRelationships(_ context.Context, tenantID string, filt
 			}
 		}
 
-		// Add tuple to result set
-		tuples = append(tuples, t.ToTuple())
-
-		// Enforce the limit if it's set
+		result = append(result, t.ToTuple())
 		count++
 		if limit > 0 && count >= limit {
 			break
 		}
 	}
 
-	return database.NewTupleCollection(tuples...).CreateTupleIterator(), nil
+	return database.NewTupleCollection(result...).CreateTupleIterator(), nil
 }
 
-// ReadRelationships reads relationships from the database taking into account the pagination.
-func (r *DataReader) ReadRelationships(_ context.Context, tenantID string, filter *base.TupleFilter, _ string, pagination database.Pagination) (collection *database.TupleCollection, ct database.EncodedContinuousToken, err error) {
-	txn := r.database.DB.Txn(false)
-	defer txn.Abort()
+// ReadRelationships reads relationships from one immutable snapshot taking
+// into account the pagination.
+func (r *DataReader) ReadRelationships(_ context.Context, tenantID string, filter *base.TupleFilter, snap string, pagination database.Pagination) (collection *database.TupleCollection, ct database.EncodedContinuousToken, err error) {
+	state, err := r.snapshotState(snap)
+	if err != nil {
+		return nil, database.NewNoopContinuousToken().Encode(), err
+	}
 
 	var lowerBound uint64
 	if pagination.Token() != "" {
@@ -130,80 +117,50 @@ func (r *DataReader) ReadRelationships(_ context.Context, tenantID string, filte
 		}
 	}
 
-	index, args := utils.GetRelationTuplesIndexNameAndArgsByFilters(tenantID, filter)
-
-	// Get the result iterator using lower bound.
-	var result memdb.ResultIterator
-	result, err = txn.LowerBound(constants.RelationTuplesTable, index, args...) // Query with lower bound
-	if err != nil {
-		return nil, database.NewNoopContinuousToken().Encode(), errors.New(base.ErrorCode_ERROR_CODE_EXECUTION.String())
-	}
-
-	// Filter the result iterator and add the tuples to the array.
-	tup := make([]storage.RelationTuple, 0, 10)
-	fit := memdb.NewFilterIterator(result, utils.FilterRelationTuplesQuery(tenantID, filter))
-	for obj := fit.Next(); obj != nil; obj = fit.Next() {
-		t, ok := obj.(storage.RelationTuple)
-		if !ok {
-			return nil, database.NewNoopContinuousToken().Encode(), errors.New(base.ErrorCode_ERROR_CODE_TYPE_CONVERSATION.String())
-		}
-		tup = append(tup, t)
-	}
-
-	// Sort the tuples and append them to the collection.
-	sort.Slice(tup, func(i, j int) bool {
-		return tup[i].ID < tup[j].ID
+	tuples := filterRelationshipState(state, tenantID, filter)
+	sort.Slice(tuples, func(i, j int) bool {
+		return tuples[i].ID < tuples[j].ID
 	})
 
-	tuples := make([]*base.Tuple, 0, pagination.PageSize()+1)
-	for _, t := range tup {
+	result := make([]*base.Tuple, 0, pagination.PageSize()+1)
+	for _, t := range tuples {
 		if t.ID >= lowerBound {
-			tuples = append(tuples, t.ToTuple())
-			if pagination.PageSize() != 0 && len(tuples) > int(pagination.PageSize()) {
-				return database.NewTupleCollection(tuples[:pagination.PageSize()]...), utils.NewContinuousToken(strconv.FormatUint(t.ID, 10)).Encode(), nil
+			result = append(result, t.ToTuple())
+			if pagination.PageSize() != 0 && len(result) > int(pagination.PageSize()) {
+				return database.NewTupleCollection(result[:pagination.PageSize()]...), utils.NewContinuousToken(strconv.FormatUint(t.ID, 10)).Encode(), nil
 			}
 		}
 	}
 
-	return database.NewTupleCollection(tuples...), database.NewNoopContinuousToken().Encode(), nil
+	return database.NewTupleCollection(result...), database.NewNoopContinuousToken().Encode(), nil
 }
 
-// QuerySingleAttribute queries the database for a single attribute based on the provided filter.
-func (r *DataReader) QuerySingleAttribute(_ context.Context, tenantID string, filter *base.AttributeFilter, _ string) (attribute *base.Attribute, err error) {
-	txn := r.database.DB.Txn(false)
-	defer txn.Abort()
-
-	// Get the index and arguments based on the filter.
-	index, args := utils.GetAttributesIndexNameAndArgsByFilters(tenantID, filter)
-
-	// Get the result iterator based on the index and arguments.
-	var result memdb.ResultIterator
-	result, err = txn.Get(constants.AttributesTable, index, args...) // Query attributes table
+// QuerySingleAttribute queries a consistent snapshot for a single attribute.
+func (r *DataReader) QuerySingleAttribute(_ context.Context, tenantID string, filter *base.AttributeFilter, snap string) (attribute *base.Attribute, err error) {
+	state, err := r.snapshotState(snap)
 	if err != nil {
-		return nil, errors.New(base.ErrorCode_ERROR_CODE_EXECUTION.String())
+		return nil, err
 	}
 
-	// Filter the result iterator and get the first attribute.
-	fit := memdb.NewFilterIterator(result, utils.FilterAttributesQuery(tenantID, filter))
-	obj := fit.Next()
-	if obj != nil {
-		t, ok := obj.(storage.Attribute)
-		if !ok {
-			return nil, errors.New(base.ErrorCode_ERROR_CODE_TYPE_CONVERSATION.String())
-		}
-		return t.ToAttribute(), nil
+	attributes := filterAttributeState(state, tenantID, filter)
+	sort.Slice(attributes, func(i, j int) bool {
+		return attributes[i].ID < attributes[j].ID
+	})
+	if len(attributes) > 0 {
+		return attributes[0].ToAttribute(), nil
 	}
-
 	return nil, nil
 }
 
-// QueryAttributes queries the database for attributes based on the provided filter.
-func (r *DataReader) QueryAttributes(_ context.Context, tenantID string, filter *base.AttributeFilter, _ string, pagination database.CursorPagination) (iterator *database.AttributeIterator, err error) {
-	txn := r.database.DB.Txn(false)
-	defer txn.Abort()
+// QueryAttributes queries a consistent snapshot for attributes matching the
+// provided filter.
+func (r *DataReader) QueryAttributes(_ context.Context, tenantID string, filter *base.AttributeFilter, snap string, pagination database.CursorPagination) (iterator *database.AttributeIterator, err error) {
+	state, err := r.snapshotState(snap)
+	if err != nil {
+		return nil, err
+	}
 
 	var lowerBound string
-
 	if pagination.Cursor() != "" {
 		var t database.ContinuousToken
 		t, err = utils.EncodedContinuousToken{Value: pagination.Cursor()}.Decode()
@@ -213,67 +170,48 @@ func (r *DataReader) QueryAttributes(_ context.Context, tenantID string, filter 
 		lowerBound = t.(utils.ContinuousToken).Value
 	}
 
-	// Get the index and arguments based on the filter.
-	index, args := utils.GetAttributesIndexNameAndArgsByFilters(tenantID, filter)
-
-	// Get the result iterator based on the index and arguments.
-	var result memdb.ResultIterator
-	result, err = txn.Get(constants.AttributesTable, index, args...) // Query attributes table
-	if err != nil {
-		return nil, errors.New(base.ErrorCode_ERROR_CODE_EXECUTION.String())
-	}
-
-	// Filter the result iterator and add the attributes to the collection.
-	attr := make([]storage.Attribute, 0, 10)
-	fit := memdb.NewFilterIterator(result, utils.FilterAttributesQuery(tenantID, filter))
-	for obj := fit.Next(); obj != nil; obj = fit.Next() {
-		t, ok := obj.(storage.Attribute)
-		if !ok {
-			return nil, errors.New(base.ErrorCode_ERROR_CODE_TYPE_CONVERSATION.String())
-		}
-		attr = append(attr, t)
-	}
-
-	// Sort attributes based on the provided order field
-	sort.Slice(attr, func(i, j int) bool {
+	attributes := filterAttributeState(state, tenantID, filter)
+	sort.Slice(attributes, func(i, j int) bool {
 		switch pagination.Sort() {
 		case "entity_id":
-			return attr[i].EntityID < attr[j].EntityID
+			return attributes[i].EntityID < attributes[j].EntityID
 		default:
-			return false // No sorting if order field is invalid
+			if attributes[i].EntityID != attributes[j].EntityID {
+				return attributes[i].EntityID < attributes[j].EntityID
+			}
+			if attributes[i].Attribute != attributes[j].Attribute {
+				return attributes[i].Attribute < attributes[j].Attribute
+			}
+			return attributes[i].ID < attributes[j].ID
 		}
 	})
 
-	var attrs []*base.Attribute
+	var result []*base.Attribute
 	count := uint32(0)
 	limit := pagination.Limit()
 
-	for _, t := range attr {
-		// Skip attributes below the lower bound
-		switch pagination.Sort() {
-		case "entity_id":
-			if t.EntityID < lowerBound {
-				continue
-			}
+	for _, a := range attributes {
+		if pagination.Sort() == "entity_id" && a.EntityID < lowerBound {
+			continue
 		}
 
-		// Add attribute to result set
-		attrs = append(attrs, t.ToAttribute())
-
-		// Enforce the limit if it's set
+		result = append(result, a.ToAttribute())
 		count++
 		if limit > 0 && count >= limit {
 			break
 		}
 	}
 
-	return database.NewAttributeCollection(attrs...).CreateAttributeIterator(), nil
+	return database.NewAttributeCollection(result...).CreateAttributeIterator(), nil
 }
 
-// ReadAttributes reads attributes from the database taking into account the pagination.
-func (r *DataReader) ReadAttributes(_ context.Context, tenantID string, filter *base.AttributeFilter, _ string, pagination database.Pagination) (collection *database.AttributeCollection, ct database.EncodedContinuousToken, err error) {
-	txn := r.database.DB.Txn(false)
-	defer txn.Abort()
+// ReadAttributes reads attributes from one immutable snapshot taking into
+// account the pagination.
+func (r *DataReader) ReadAttributes(_ context.Context, tenantID string, filter *base.AttributeFilter, snap string, pagination database.Pagination) (collection *database.AttributeCollection, ct database.EncodedContinuousToken, err error) {
+	state, err := r.snapshotState(snap)
+	if err != nil {
+		return nil, database.NewNoopContinuousToken().Encode(), err
+	}
 
 	var lowerBound uint64
 	if pagination.Token() != "" {
@@ -288,49 +226,31 @@ func (r *DataReader) ReadAttributes(_ context.Context, tenantID string, filter *
 		}
 	}
 
-	// Get the index and arguments based on the filter.
-	index, args := utils.GetAttributesIndexNameAndArgsByFilters(tenantID, filter)
-
-	// Get the result iterator using lower bound.
-	var result memdb.ResultIterator
-	result, err = txn.LowerBound(constants.AttributesTable, index, args...)
-	if err != nil {
-		return nil, database.NewNoopContinuousToken().Encode(), errors.New(base.ErrorCode_ERROR_CODE_EXECUTION.String())
-	}
-
-	// Filter the result iterator and add the attributes to the array.
-	attr := make([]storage.Attribute, 0, 10)
-	fit := memdb.NewFilterIterator(result, utils.FilterAttributesQuery(tenantID, filter))
-	for obj := fit.Next(); obj != nil; obj = fit.Next() {
-		a, ok := obj.(storage.Attribute)
-		if !ok {
-			return nil, database.NewNoopContinuousToken().Encode(), errors.New(base.ErrorCode_ERROR_CODE_TYPE_CONVERSATION.String())
-		}
-		attr = append(attr, a)
-	}
-
-	// Sort the attributes and append them to the collection.
-	sort.Slice(attr, func(i, j int) bool {
-		return attr[i].ID < attr[j].ID
+	attributes := filterAttributeState(state, tenantID, filter)
+	sort.Slice(attributes, func(i, j int) bool {
+		return attributes[i].ID < attributes[j].ID
 	})
 
-	attributes := make([]*base.Attribute, 0, pagination.PageSize()+1)
-	for _, t := range attr {
-		if t.ID >= lowerBound {
-			attributes = append(attributes, t.ToAttribute())
-			if pagination.PageSize() != 0 && len(attributes) > int(pagination.PageSize()) {
-				return database.NewAttributeCollection(attributes[:pagination.PageSize()]...), utils.NewContinuousToken(strconv.FormatUint(t.ID, 10)).Encode(), nil
+	result := make([]*base.Attribute, 0, pagination.PageSize()+1)
+	for _, a := range attributes {
+		if a.ID >= lowerBound {
+			result = append(result, a.ToAttribute())
+			if pagination.PageSize() != 0 && len(result) > int(pagination.PageSize()) {
+				return database.NewAttributeCollection(result[:pagination.PageSize()]...), utils.NewContinuousToken(strconv.FormatUint(a.ID, 10)).Encode(), nil
 			}
 		}
 	}
 
-	return database.NewAttributeCollection(attributes...), database.NewNoopContinuousToken().Encode(), nil
+	return database.NewAttributeCollection(result...), database.NewNoopContinuousToken().Encode(), nil
 }
 
-// QueryUniqueSubjectReferences is a function that searches for unique subject references in a given database.
-func (r *DataReader) QueryUniqueSubjectReferences(_ context.Context, tenantID string, subjectReference *base.RelationReference, excluded []string, _ string, pagination database.Pagination) (ids []string, _ database.EncodedContinuousToken, err error) {
-	txn := r.database.DB.Txn(false)
-	defer txn.Abort()
+// QueryUniqueSubjectReferences queries unique subject references from one
+// immutable snapshot.
+func (r *DataReader) QueryUniqueSubjectReferences(_ context.Context, tenantID string, subjectReference *base.RelationReference, excluded []string, snap string, pagination database.Pagination) (ids []string, _ database.EncodedContinuousToken, err error) {
+	state, err := r.snapshotState(snap)
+	if err != nil {
+		return nil, database.NewNoopContinuousToken().Encode(), err
+	}
 
 	var lowerBound string
 	if pagination.Token() != "" {
@@ -342,51 +262,34 @@ func (r *DataReader) QueryUniqueSubjectReferences(_ context.Context, tenantID st
 		lowerBound = t.(utils.ContinuousToken).Value
 	}
 
-	// Get the result iterator based on the index and arguments.
-	result, err := txn.LowerBound(constants.RelationTuplesTable, "id")
-	if err != nil {
-		return nil, database.NewNoopContinuousToken().Encode(), errors.New(base.ErrorCode_ERROR_CODE_EXECUTION.String())
-	}
-
-	var subjectIDs []string
-
-	// Filter the result iterator and add the tuples to the collection.
-	fit := memdb.NewFilterIterator(result, utils.FilterRelationTuplesQuery(tenantID, &base.TupleFilter{
+	filter := &base.TupleFilter{
 		Subject: &base.SubjectFilter{
 			Type:     subjectReference.GetType(),
 			Relation: subjectReference.GetRelation(),
 		},
-	}))
-	for obj := fit.Next(); obj != nil; obj = fit.Next() {
-		t, ok := obj.(storage.RelationTuple)
-		if !ok {
-			return nil, database.NewNoopContinuousToken().Encode(), errors.New(base.ErrorCode_ERROR_CODE_TYPE_CONVERSATION.String())
-		}
+	}
+	tuples := filterRelationshipState(state, tenantID, filter)
+
+	var subjectIDs []string
+	for _, t := range tuples {
 		subjectIDs = append(subjectIDs, t.SubjectID)
 	}
+	sort.Strings(subjectIDs)
 
-	// Sort the tuples and append them to the collection.
-	sort.Slice(subjectIDs, func(i, j int) bool {
-		return subjectIDs[i] < subjectIDs[j]
-	})
-
-	mp := make(map[string]bool)
+	seen := make(map[string]bool)
 	var lastID string
-
-	for _, b := range subjectIDs {
-		if slices.Contains(excluded, b) {
+	for _, subjectID := range subjectIDs {
+		if slices.Contains(excluded, subjectID) {
 			continue
 		}
-		if _, exists := mp[b]; !exists && b >= lowerBound {
-			ids = append(ids, b)
-			mp[b] = true
+		if _, exists := seen[subjectID]; !exists && subjectID >= lowerBound {
+			ids = append(ids, subjectID)
+			seen[subjectID] = true
 
-			// Capture the last ID after adding pagesize + 1 elements
 			if len(ids) == int(pagination.PageSize())+1 {
-				lastID = b
+				lastID = subjectID
 			}
 
-			// Stop appending if we've reached the page size
 			if pagination.PageSize() != 0 && len(ids) > int(pagination.PageSize()) {
 				return ids[:pagination.PageSize()], utils.NewContinuousToken(lastID).Encode(), nil
 			}
@@ -396,7 +299,65 @@ func (r *DataReader) QueryUniqueSubjectReferences(_ context.Context, tenantID st
 	return ids, database.NewNoopContinuousToken().Encode(), nil
 }
 
-// HeadSnapshot - Reads the latest version of the snapshot from the repository.
+// HeadSnapshot - Reads the latest committed snapshot from the repository.
 func (r *DataReader) HeadSnapshot(_ context.Context, _ string) (token.SnapToken, error) {
-	return snapshot.NewToken(time.Now()), nil
+	return snapshot.NewTokenFromValue(r.database.LatestSnapshot()), nil
+}
+
+func (r *DataReader) snapshotState(snap string) (*snapshot.State, error) {
+	if snap != "" {
+		decoded, err := snapshot.EncodedToken{Value: snap}.Decode()
+		if err == nil {
+			if value, ok := decoded.(snapshot.Token); ok {
+				if state, found := r.database.Snapshot(value.Value); found {
+					if snapshotState, ok := state.(*snapshot.State); ok {
+						return snapshotState, nil
+					}
+				}
+				if value.Value == 0 {
+					return &snapshot.State{}, nil
+				}
+			}
+		}
+	}
+
+	if state, found := r.database.Snapshot(r.database.LatestSnapshot()); found {
+		if snapshotState, ok := state.(*snapshot.State); ok {
+			return snapshotState, nil
+		}
+	}
+	return &snapshot.State{}, nil
+}
+
+func filterRelationshipState(state *snapshot.State, tenantID string, filter *base.TupleFilter) []storage.RelationTuple {
+	exclude := utils.FilterRelationTuplesQuery(tenantID, filter)
+	result := make([]storage.RelationTuple, 0, len(state.Tuples))
+	for _, tuple := range state.Tuples {
+		if !exclude(tuple) {
+			result = append(result, tuple)
+		}
+	}
+	return result
+}
+
+func filterAttributeState(state *snapshot.State, tenantID string, filter *base.AttributeFilter) []storage.Attribute {
+	exclude := utils.FilterAttributesQuery(tenantID, filter)
+	result := make([]storage.Attribute, 0, len(state.Attributes))
+	for _, attribute := range state.Attributes {
+		if !exclude(attribute) {
+			result = append(result, attribute)
+		}
+	}
+	return result
+}
+
+func stringsCompare(left, right string) int {
+	switch {
+	case left < right:
+		return -1
+	case left > right:
+		return 1
+	default:
+		return 0
+	}
 }
